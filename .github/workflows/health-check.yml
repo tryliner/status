@@ -1,0 +1,73 @@
+name: API Health Check
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check Liner API health
+        id: probe
+        shell: bash
+        run: |
+          node -e '
+            const fs = require("fs");
+            const current = JSON.parse(fs.readFileSync("status.json", "utf8"));
+            const hasMessage = Object.values(current.message || {}).some(
+              (v) => typeof v === "string" && v.trim().length > 0,
+            );
+            if (current.status === "degraded" || hasMessage) {
+              console.log("Active incident note present; skipping automated update.");
+              process.exit(0);
+            }
+
+            async function probeOnce() {
+              try {
+                const res = await fetch("https://api.tryliner.fun/health", {
+                  signal: AbortSignal.timeout(8000),
+                });
+                return res.ok;
+              } catch {
+                return false;
+              }
+            }
+
+            (async () => {
+              let ok = await probeOnce();
+              if (!ok) {
+                await new Promise((r) => setTimeout(r, 4000));
+                ok = await probeOnce();
+              }
+              const nextStatus = ok ? "operational" : "outage";
+              if (current.status === nextStatus) {
+                console.log("Status unchanged:", nextStatus);
+                process.exit(0);
+              }
+              const next = {
+                status: nextStatus,
+                message: { en: "", ru: "" },
+                updatedAt: new Date().toISOString(),
+              };
+              fs.writeFileSync("status.json", JSON.stringify(next, null, 2) + "\n");
+              console.log("Updated status:", current.status, "->", nextStatus);
+            })();
+          '
+
+      - name: Commit status change
+        run: |
+          if git diff --quiet status.json; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add status.json
+          git commit -m "chore: update api status"
+          git push
